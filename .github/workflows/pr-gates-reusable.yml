@@ -11,11 +11,11 @@ on:
   workflow_call:
     secrets:
       DEEPSEEK_API_KEY:
-        required: true
+        required: false
       OPENAI_API_KEY:
-        required: true
+        required: false
       CLAUDE_CODE_OAUTH_TOKEN:
-        required: true
+        required: false
       ANTHROPIC_API_KEY:
         required: false
       PUSHOVER_APP_TOKEN:
