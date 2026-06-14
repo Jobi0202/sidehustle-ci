@@ -3,5 +3,5 @@ on:
   workflow_dispatch:
 jobs:
   call:
-    uses: ./.github/workflows/pr-gates-reusable.yml
+    uses: ./.github/workflows/_probe.yml
     secrets: inherit
