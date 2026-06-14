@@ -9,6 +9,24 @@ name: Reusable PR Gates
 
 on:
   workflow_call:
+    inputs:
+      merge_mode:
+        # How the final gates-green job merges a fully-green PR:
+        #   auto   — `gh pr merge --auto --squash` (DEFAULT). Queues the merge so it
+        #            isn't blocked by the in-progress "Gates Green" required check.
+        #            Requires GitHub-flow that supports auto-merge (a paid plan / branch
+        #            protection). This is the PUBLIC foundation's behaviour and stays the
+        #            default so no existing caller has to change anything.
+        #   direct — `gh pr merge --squash` (no --auto). Merges immediately once every
+        #            gate is green. Works on a FREE private repo precisely because Free has
+        #            no branch protection, so there is no "Gates Green" required-check
+        #            self-deadlock and no auto-merge entitlement is needed.
+        # The tier-3 schranke is UNAFFECTED by this input: a tier-3 PR without jo-approved
+        # is blocked before the merge step regardless of merge_mode.
+        description: 'Merge strategy for green PRs: auto (--auto, default) or direct (immediate squash, Free-plan).'
+        type: string
+        required: false
+        default: auto
     secrets:
       DEEPSEEK_API_KEY:
         required: false
@@ -459,17 +477,30 @@ jobs:
               exit 1 ;;
           esac
 
-      - name: Enable auto-merge (only after all gates green)
+      - name: Merge green PR (mode-dependent — auto vs direct)
         if: success()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MERGE_MODE: ${{ inputs.merge_mode }}
         run: |
-          # Use --auto, NOT an immediate merge. `Gates Green` is itself a required
-          # status check on main, so an immediate `gh pr merge` is rejected with
-          # "base branch policy prohibits the merge" — at that instant this very job's
-          # check is still in-progress. --auto instead QUEUES the squash-merge; GitHub
-          # fires it the moment all required checks (incl. this job, once it finishes
-          # green) are satisfied. No --admin, required checks respected.
           PR=${{ github.event.pull_request.number }}
-          echo "All gates green. Enabling auto-merge (squash) for PR #$PR..."
-          gh pr merge "$PR" --repo ${{ github.repository }} --auto --squash --delete-branch
+          case "${MERGE_MODE:-auto}" in
+            direct)
+              # FREE-PLAN path. No branch protection => no "Gates Green" required-check
+              # self-deadlock and no auto-merge entitlement, so an immediate squash is
+              # both allowed and the only thing that works. This job runs last (needs all
+              # gates), so every gate is already green when we reach here.
+              echo "merge_mode=direct — squash-merging green PR #$PR immediately (Free-plan)..."
+              gh pr merge "$PR" --repo ${{ github.repository }} --squash --delete-branch
+              ;;
+            *)
+              # DEFAULT (auto). Use --auto, NOT an immediate merge. `Gates Green` is itself a
+              # required status check on main, so an immediate `gh pr merge` is rejected with
+              # "base branch policy prohibits the merge" — at that instant this very job's
+              # check is still in-progress. --auto instead QUEUES the squash-merge; GitHub
+              # fires it the moment all required checks (incl. this job, once it finishes
+              # green) are satisfied. No --admin, required checks respected.
+              echo "merge_mode=auto — enabling auto-merge (squash) for PR #$PR..."
+              gh pr merge "$PR" --repo ${{ github.repository }} --auto --squash --delete-branch
+              ;;
+          esac
