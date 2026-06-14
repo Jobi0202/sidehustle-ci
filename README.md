@@ -28,6 +28,15 @@ concurrency:
   group: pr-gates-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+# REQUIRED: a called workflow's job permissions are capped by the caller's grant, and the
+# repo default is read-only. Grant the union the reusable jobs need or the run fails at
+# STARTUP (`startup_failure`). Each reusable job still narrows to its own least-privilege set.
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+
 jobs:
   gates:
     uses: Jobi0202/sidehustle-ci/.github/workflows/pr-gates-reusable.yml@main
