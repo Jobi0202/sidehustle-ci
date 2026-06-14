@@ -1,48 +1,26 @@
-# Reusable PR Gates — the single source of truth for the sidehustle fleet's PR pipeline.
-#
-# This file lives in the PUBLIC repo Jobi0202/sidehustle-ci and contains ONLY workflow YAML:
-# no product code, and no secret VALUES (only secret NAMES — values are injected at runtime
-# from each private caller via `secrets: inherit`).
-#
-# Callers (foundation + each Idea-Repo) are thin:
-#   on: pull_request: { types: [...] }
-#   concurrency: { group: pr-gates-${{ github.event.pull_request.number }}, cancel-in-progress: true }
-#   jobs:
-#     gates:
-#       uses: Jobi0202/sidehustle-ci/.github/workflows/pr-gates-reusable.yml@main
-#       secrets: inherit
-#
-# Pinning is @main on purpose: a central change (e.g. the post-15.06 Max-Switch) propagates
-# to every caller with no child edit. The fleet is single-owner and this repo is YAML-only,
-# so the usual "pin a tag" supply-chain caution does not apply. A `v1` tag is also published
-# as a stable snapshot for anyone who prefers an immutable pin.
-#
-# IMPORTANT: the github context inside a called workflow is the CALLER's triggering event, so
-# `github.event.pull_request.*` and `github.repository` resolve to the caller's PR/repo. The
-# per-job `actions/checkout` checks out the CALLER repo, so scripts/classify-tier.sh and
-# .claude/rules/* are read from the caller (every caller is a template clone that has them).
+# Reusable PR Gates — single source of truth for the sidehustle fleet's PR pipeline.
+# PUBLIC, YAML-only repo: no product code, no secret VALUES (only names; values injected
+# by each private caller via `secrets: inherit`). The github context inside a called
+# workflow is the CALLER's event, so github.event.pull_request.* and github.repository
+# resolve to the caller's PR/repo, and each job's checkout reads the caller repo
+# (scripts/classify-tier.sh + .claude/rules/* live there). Job bodies are byte-identical
+# to the foundation's former monolithic pr-gates.yml — only this header changed.
 name: Reusable PR Gates
 
 on:
   workflow_call:
     secrets:
       DEEPSEEK_API_KEY:
-        description: DeepSeek key — Gate 2 routes Claude Code via ANTHROPIC_BASE_URL.
         required: true
       OPENAI_API_KEY:
-        description: OpenAI key — Gate 3 (openai/codex-action). 2-day bridge until Max-Switch.
         required: true
       CLAUDE_CODE_OAUTH_TOKEN:
-        description: Anthropic OAuth — architect gate (tier-2/3, Opus).
         required: true
       ANTHROPIC_API_KEY:
-        description: Optional rollback path for Gate 2 (disabled by default).
         required: false
       PUSHOVER_APP_TOKEN:
-        description: Optional — push alert when a tier-3 PR is blocked on jo-approved.
         required: false
       PUSHOVER_USER_KEY:
-        description: Optional — Pushover recipient for the tier-3 block alert.
         required: false
 
 jobs:
