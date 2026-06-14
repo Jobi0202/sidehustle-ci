@@ -41,6 +41,22 @@ jobs:
   gates:
     uses: Jobi0202/sidehustle-ci/.github/workflows/pr-gates-reusable.yml@main
     secrets: inherit
+
+  # Re-exports the aggregate result under the stable check name "Gates Green" that branch
+  # protection requires. Reusable job checks are always prefixed "gates / ...", so keeping
+  # this caller-level job means NO branch-protection edit is needed when a repo migrates.
+  gates-green:
+    name: Gates Green
+    needs: [gates]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          result='${{ needs.gates.result }}'
+          if [ "$result" != "success" ]; then
+            echo "::error::Reusable PR Gates did not succeed (result=$result)."; exit 1
+          fi
+          echo "Reusable PR Gates passed — Gates Green."
 ```
 
 The called workflow runs in the **caller's** context: `github.event.pull_request.*` and
