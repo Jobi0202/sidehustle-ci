@@ -1,0 +1,497 @@
+# Reusable PR Gates — the single source of truth for the sidehustle fleet's PR pipeline.
+#
+# This file lives in the PUBLIC repo Jobi0202/sidehustle-ci and contains ONLY workflow YAML:
+# no product code, and no secret VALUES (only secret NAMES — values are injected at runtime
+# from each private caller via `secrets: inherit`).
+#
+# Callers (foundation + each Idea-Repo) are thin:
+#   on: pull_request: { types: [...] }
+#   concurrency: { group: pr-gates-${{ github.event.pull_request.number }}, cancel-in-progress: true }
+#   jobs:
+#     gates:
+#       uses: Jobi0202/sidehustle-ci/.github/workflows/pr-gates-reusable.yml@main
+#       secrets: inherit
+#
+# Pinning is @main on purpose: a central change (e.g. the post-15.06 Max-Switch) propagates
+# to every caller with no child edit. The fleet is single-owner and this repo is YAML-only,
+# so the usual "pin a tag" supply-chain caution does not apply. A `v1` tag is also published
+# as a stable snapshot for anyone who prefers an immutable pin.
+#
+# IMPORTANT: the github context inside a called workflow is the CALLER's triggering event, so
+# `github.event.pull_request.*` and `github.repository` resolve to the caller's PR/repo. The
+# per-job `actions/checkout` checks out the CALLER repo, so scripts/classify-tier.sh and
+# .claude/rules/* are read from the caller (every caller is a template clone that has them).
+name: Reusable PR Gates
+
+on:
+  workflow_call:
+    secrets:
+      DEEPSEEK_API_KEY:
+        description: DeepSeek key — Gate 2 routes Claude Code via ANTHROPIC_BASE_URL.
+        required: true
+      OPENAI_API_KEY:
+        description: OpenAI key — Gate 3 (openai/codex-action). 2-day bridge until Max-Switch.
+        required: true
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: Anthropic OAuth — architect gate (tier-2/3, Opus).
+        required: true
+      ANTHROPIC_API_KEY:
+        description: Optional rollback path for Gate 2 (disabled by default).
+        required: false
+      PUSHOVER_APP_TOKEN:
+        description: Optional — push alert when a tier-3 PR is blocked on jo-approved.
+        required: false
+      PUSHOVER_USER_KEY:
+        description: Optional — Pushover recipient for the tier-3 block alert.
+        required: false
+
+jobs:
+  workflow-lint:
+    name: Workflow Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker://rhysd/actionlint:latest
+        with:
+          args: -color
+
+  lint:
+    name: Lint
+    needs: [workflow-lint]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+
+  typecheck:
+    name: Typecheck
+    needs: [workflow-lint]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+
+  unit:
+    name: Unit Tests
+    needs: [workflow-lint]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+
+  e2e:
+    name: E2E Tests
+    needs: [workflow-lint]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm test:e2e
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
+
+  claude-review:
+    name: Claude Review (Gate 2)
+    needs: [workflow-lint, lint, typecheck, unit, e2e]
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    env:
+      # ROLLBACK-PFAD (deaktiviert seit 2026-06-04, Jo's Standing-Order DeepSeek-Default).
+      # Falls Rollback auf Anthropic nötig: untere 5 DeepSeek-Zeilen auskommentieren, untere
+      # ANTHROPIC_API_KEY-Zeile aktivieren.
+      # ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ANTHROPIC_BASE_URL: https://api.deepseek.com/anthropic
+      ANTHROPIC_AUTH_TOKEN: ${{ secrets.DEEPSEEK_API_KEY }}
+      ANTHROPIC_MODEL: deepseek-v4-flash
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: deepseek-v4-flash
+      CLAUDE_CODE_SUBAGENT_MODEL: deepseek-v4-flash
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code@latest
+
+      - name: Run /review-pr (Gate 2) — stdout to file
+        id: claude_review
+        run: |
+          set +e
+          PR=${{ github.event.pull_request.number }}
+          claude -p "/review-pr $PR" --model deepseek-v4-flash > /tmp/claude_review.txt 2>&1
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Post Claude Review verdict to PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR=${{ github.event.pull_request.number }}
+          {
+            echo "## Gate 2 — Claude Review"
+            echo ""
+            echo "Exit code: ${{ steps.claude_review.outputs.exit_code }}"
+            echo ""
+            echo '<details><summary>Full verdict (stdout)</summary>'
+            echo ''
+            echo '```'
+            cat /tmp/claude_review.txt 2>/dev/null || echo 'No output captured.'
+            echo '```'
+            echo '</details>'
+          } > /tmp/claude_review_comment.md
+          gh pr comment "$PR" -F /tmp/claude_review_comment.md || true
+
+      - name: Verify VERDICT format present (Gate 2 format-drift guard)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The /review-pr reviewer posts the canonical VERDICT as a PR
+          # comment and emits only a one-line summary to stdout. Accept a
+          # VERDICT: line from EITHER surface; fail only if neither has one
+          # (true format-drift or the reviewer never posted a verdict).
+          PR=${{ github.event.pull_request.number }}
+          if grep -qE "^VERDICT:" /tmp/claude_review.txt 2>/dev/null; then
+            echo "VERDICT line found in reviewer stdout."
+          elif gh pr view "$PR" --repo "${{ github.repository }}" --json comments --jq '.comments[].body' | grep -qE "^VERDICT:"; then
+            echo "VERDICT line found in a posted PR comment."
+          else
+            echo "::error::Gate 2 — no VERDICT: line in reviewer stdout or PR comments. Format-drift. Failing gate."
+            exit 1
+          fi
+
+      - name: Enforce Gate 2 verdict
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR=${{ github.event.pull_request.number }}
+          # Condition 1 (independent): the reviewer CLI must have exited 0.
+          if [ "${{ steps.claude_review.outputs.exit_code }}" != "0" ]; then
+            echo "::error::Gate 2 FAILED — Claude Review returned non-zero exit."
+            exit 1
+          fi
+          # Condition 2 (independent): the VERDICT *content* must be PASS. The reviewer
+          # posts the canonical verdict to a PR comment and/or stdout; read the VERDICT
+          # value from stdout first, else from the latest PR comment.
+          verdict="$(grep -oE '^VERDICT:[[:space:]]*(PASS|FAIL|PARTIAL)' /tmp/claude_review.txt 2>/dev/null | head -1 | awk '{print $2}')"
+          if [ -z "$verdict" ]; then
+            verdict="$(gh pr view "$PR" --repo "${{ github.repository }}" --json comments --jq '.comments[].body' | grep -oE '^VERDICT:[[:space:]]*(PASS|FAIL|PARTIAL)' | tail -1 | awk '{print $2}')"
+          fi
+          if [ "$verdict" = "PASS" ]; then
+            echo "Gate 2 PASSED (VERDICT: PASS, exit 0)."
+          else
+            echo "::error::Gate 2 FAILED — verdict=${verdict:-MISSING} (only VERDICT: PASS passes)."
+            exit 1
+          fi
+
+  codex-adversarial:
+    name: Codex Adversarial Review (Gate 3)
+    needs: [workflow-lint, claude-review]
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    # Pure OpenAI stack — no Anthropic/DeepSeek env here. Gate 3's cross-family
+    # anchor: Gate 2 reviews on DeepSeek, Gate 3 adversarially re-reviews on OpenAI.
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Codex adversarial review (headless, openai/codex-action)
+        id: codex
+        continue-on-error: true
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          # Pinned for predictable cost (input names verified against codex-action action.yml).
+          # The codex-specialised line tops out at gpt-5.3-codex (latest; gpt-5.5/5.4 are the
+          # GENERAL models, there is no gpt-5.5-codex — confirmed model_not_found). 5.3-codex
+          # is the smartest codex model; NOT a -mini (too weak for the safety gate).
+          # effort=medium is the main cost lever.
+          model: gpt-5.3-codex
+          effort: medium
+          sandbox: read-only
+          output-file: codex-output.md
+          prompt: |
+            You are the Gate 3 adversarial reviewer for this pull request. Do NOT modify
+            any files — this is a read-only review.
+
+            Scope: review the diff between the PR base commit
+            ${{ github.event.pull_request.base.sha }} and HEAD. Run
+            `git diff ${{ github.event.pull_request.base.sha }} HEAD` to see every change.
+
+            Apply the rubric in ./.claude/rules/review.md — all six criteria (Issue Match,
+            Architecture, Test Sufficiency, Code Health, Boy Scout, Safety). Be adversarial,
+            but apply the SEVERITY GATE in ./.claude/rules/review.md. Classify every finding
+            as exactly one severity:
+              - CRITICAL: a security vulnerability, a correctness/logic bug, or a violation
+                of an architecture invariant in ./.claude/rules/architecture.md (a forbidden
+                pattern, a layer/dependency-direction break, a missing module index.ts, raw
+                SQL outside migrations, a committed secret, or a risk-path change missing its
+                required label).
+              - ADVISORY: everything else — style, naming, magic numbers, documentation
+                drift, test rigor/coverage suggestions, robustness/edge-case hardening,
+                performance, "nice to have". ADVISORY findings NEVER cause FAIL.
+
+            Decide the verdict by this rule ONLY:
+              VERDICT: FAIL  iff there is at least one CRITICAL finding;
+              VERDICT: PASS  iff there are zero CRITICAL findings (ADVISORY findings are OK).
+
+            Delta-awareness: if you have reviewed this PR before, read your previous verdict
+            comment first. Do NOT re-raise findings the current diff already resolves, and do
+            NOT invent new ADVISORY side-quests to justify a FAIL.
+
+            Output format (output ONLY this, nothing else):
+            - FIRST line, exactly: `VERDICT: PASS` or `VERDICT: FAIL`.
+            - Then the six CRITERIA lines (`- <Criterion>: PASS|FAIL — <evidence>`).
+            - Then `FINDINGS:` and one line per finding, each starting with `[CRITICAL]` or
+              `[ADVISORY]` followed by `<path:line> — <required fix>`. Write `[none]` if there
+              are no findings.
+            - LAST line, exactly: `SEVERITY_SUMMARY: CRITICAL=<n> ADVISORY=<m>` where <n> is
+              the number of [CRITICAL] lines and <m> the number of [ADVISORY] lines.
+
+      - name: Post Codex verdict to PR
+        if: always()
+        run: |
+          PR=${{ github.event.pull_request.number }}
+          {
+            echo "## Gate 3 — Codex Adversarial Review (openai/codex-action)"
+            echo ""
+            if [ -s codex-output.md ]; then
+              cat codex-output.md
+            else
+              echo "_No verdict produced — codex-action emitted no output (treated as FAIL)._"
+            fi
+          } > /tmp/codex_verdict.md
+          gh pr comment "$PR" -F /tmp/codex_verdict.md || true
+
+      - name: Verify VERDICT format present (Gate 3 format-drift guard)
+        run: |
+          # Fail-safe: any format drift => FAIL, so a malformed review can never become a
+          # silent PASS. Requires (a) a canonical first-line VERDICT and (b) the
+          # machine-readable SEVERITY_SUMMARY line the enforce step parses.
+          first_line="$(head -n1 codex-output.md 2>/dev/null || true)"
+          if ! printf '%s\n' "$first_line" | grep -qE '^VERDICT:[[:space:]]*(PASS|FAIL)[[:space:]]*$'; then
+            echo "::error::Gate 3 — first line of codex-output.md is not 'VERDICT: PASS|FAIL'. Got: ${first_line:-<empty>}. Failing gate."
+            exit 1
+          fi
+          if ! grep -qE '^SEVERITY_SUMMARY: CRITICAL=[0-9]+ ADVISORY=[0-9]+$' codex-output.md; then
+            echo "::error::Gate 3 — missing 'SEVERITY_SUMMARY: CRITICAL=<n> ADVISORY=<m>' line (format drift). Failing gate."
+            exit 1
+          fi
+          echo "Format OK: $first_line"
+
+      - name: Enforce gate verdict (severity gate — only CRITICAL blocks)
+        run: |
+          # (1) The codex-action step itself must have succeeded (guards continue-on-error
+          #     so an action failure can never be masked by a stale output file).
+          if [ "${{ steps.codex.outcome }}" != "success" ]; then
+            echo "::error::Gate 3 FAILED — codex-action step outcome=${{ steps.codex.outcome }} (not success)."
+            exit 1
+          fi
+          # (2) Authoritative severity gate, computed by the workflow (not codex's self-
+          #     verdict): block iff there is >= 1 CRITICAL finding, by the MAX of two
+          #     independent measures — the SEVERITY_SUMMARY count and the number of
+          #     [CRITICAL]-tagged finding lines. ADVISORY findings never block.
+          summary="$(grep -E '^SEVERITY_SUMMARY: CRITICAL=[0-9]+ ADVISORY=[0-9]+$' codex-output.md | tail -1 || true)"
+          sum_crit="$(printf '%s' "$summary" | sed -nE 's/^SEVERITY_SUMMARY: CRITICAL=([0-9]+).*/\1/p')"
+          sum_crit="${sum_crit:-0}"
+          tag_crit="$(grep -cE '^[[:space:]]*(- )?\[CRITICAL\]' codex-output.md || true)"
+          tag_crit="${tag_crit:-0}"
+          crit=$(( sum_crit > tag_crit ? sum_crit : tag_crit ))
+          if [ "$crit" -gt 0 ]; then
+            echo "::error::Gate 3 FAILED — ${crit} CRITICAL finding(s). (ADVISORY findings are non-blocking.)"
+            exit 1
+          fi
+          echo "Gate 3 PASSED — 0 CRITICAL findings; advisories (if any) are non-blocking."
+
+  architect-gate:
+    name: Architect Gate (tier-2/3)
+    needs: [workflow-lint, claude-review]
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    # Third model family (Gate 2 DeepSeek, Gate 3 OpenAI, architect Anthropic-Opus).
+    # Always runs and resolves the tier at RUNTIME (no job-level `if` on event-payload
+    # labels — that races auto-label-risk). For tier-1 it is a no-op PASS, so it can sit
+    # in gates-green needs without alls-green skip handling.
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Determine tier (recomputed from the diff — never the mutable label)
+        id: tier
+        run: |
+          # Compute the tier authoritatively from the diff via the shared classifier.
+          # Labels are mutable (anyone with write access could relabel a tier-3 PR), so
+          # the gate must not trust them — it recomputes.
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          files="$(git diff --name-only "$base" "$head")"
+          tier="$(printf '%s\n' "$files" | bash scripts/classify-tier.sh)"
+          echo "Computed tier: $tier"
+          case "$tier" in
+            tier-2|tier-3) echo "run=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "run=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+      - name: Install Claude Code CLI
+        if: steps.tier.outputs.run == 'true'
+        run: npm install -g @anthropic-ai/claude-code@latest
+      - name: Architect review (Anthropic Opus — irreversibility + schema-safety)
+        if: steps.tier.outputs.run == 'true'
+        id: arch
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set +e
+          BASE='${{ github.event.pull_request.base.sha }}'
+          claude -p "You are the ARCHITECT GATE for a tier-2/tier-3 risk PR. Review the diff: run \`git diff $BASE HEAD\`. Judge EXCLUSIVELY two things: (1) IRREVERSIBILITY — destructive or breaking DDL / data loss that cannot be cleanly rolled back; (2) SCHEMA-SAFETY against existing rows — e.g. ADD COLUMN NOT NULL without DEFAULT on a populated table, type narrowing, a UNIQUE constraint on possibly-duplicate data, or a long-locking migration. Your FIRST line must be exactly 'VERDICT: PASS' or 'VERDICT: FAIL', then 2-6 lines of evidence. PASS only if the change is reversible AND safe against existing rows; otherwise FAIL." --model opus > /tmp/arch.txt 2>&1
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          echo "--- architect output ---"; cat /tmp/arch.txt
+          exit 0
+      - name: Post architect verdict to PR
+        if: steps.tier.outputs.run == 'true'
+        run: |
+          PR=${{ github.event.pull_request.number }}
+          {
+            echo "## Architect Gate (tier-2/3) — Anthropic Opus"
+            echo ""
+            if [ -s /tmp/arch.txt ]; then cat /tmp/arch.txt; else echo "_No architect output (treated as FAIL)._"; fi
+          } > /tmp/arch_comment.md
+          gh pr comment "$PR" -F /tmp/arch_comment.md || true
+      - name: Enforce architect verdict
+        if: steps.tier.outputs.run == 'true'
+        run: |
+          if [ "${{ steps.arch.outputs.exit_code }}" != "0" ]; then
+            echo "::error::Architect gate — claude CLI exited non-zero."
+            exit 1
+          fi
+          first_line="$(head -n1 /tmp/arch.txt 2>/dev/null || true)"
+          verdict="$(printf '%s' "$first_line" | sed -nE 's/^VERDICT:[[:space:]]*(PASS|FAIL)[[:space:]]*$/\1/p')"
+          if [ "$verdict" = "PASS" ]; then
+            echo "Architect gate PASSED (VERDICT: PASS)."
+          else
+            echo "::error::Architect gate FAILED — first-line verdict=${verdict:-MALFORMED} (needs-rework)."
+            exit 1
+          fi
+      - name: Tier-1 — architect gate not required
+        if: steps.tier.outputs.run != 'true'
+        run: echo "PR is tier-1 — architect gate not required. PASS."
+
+  gates-green:
+    name: Gates Green
+    if: always() && github.event.pull_request.draft == false && github.event.pull_request.base.ref == 'main'
+    needs: [workflow-lint, lint, typecheck, unit, e2e, claude-review, codex-adversarial, architect-gate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Aggregate result (alls-green)
+        id: alls
+        uses: re-actors/alls-green@release/v1
+        with:
+          jobs: ${{ toJSON(needs) }}
+
+      - name: Checkout (to recompute the tier from the diff)
+        if: success()
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tier-3 gate (recomputed from the diff — never the mutable label)
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
+          PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
+        run: |
+          PR=${{ github.event.pull_request.number }}
+          # Recompute the tier from the diff with the shared classifier — tier-* labels are
+          # mutable, so relabelling a tier-3 PR as tier-1 must NOT bypass jo-approved. Only
+          # `jo-approved` (a deliberate Jo action; the labeled trigger re-runs this gate) is
+          # read, and only when the COMPUTED tier is tier-3.
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          files="$(git diff --name-only "$base" "$head")"
+          tier="$(printf '%s\n' "$files" | bash scripts/classify-tier.sh)"
+          echo "Recomputed tier: $tier"
+          if [ "$tier" != "tier-3" ]; then
+            echo "Recomputed $tier — not tier-3, merge allowed (tier-2 was carried by architect-gate)."
+            exit 0
+          fi
+          labels=$(gh pr view "$PR" --repo "${{ github.repository }}" --json labels --jq '[.labels[].name] | join(",")')
+          case ",$labels," in
+            *,jo-approved,*) echo "tier-3 + jo-approved — merge allowed." ;;
+            *)
+              echo "::error::tier-3 (recomputed from the diff) without jo-approved — auto-merge blocked until Jo approves."
+              if [ -n "${PUSHOVER_APP_TOKEN:-}" ] && [ -n "${PUSHOVER_USER_KEY:-}" ]; then
+                curl -sS https://api.pushover.net/1/messages.json \
+                  --form-string "token=${PUSHOVER_APP_TOKEN}" \
+                  --form-string "user=${PUSHOVER_USER_KEY}" \
+                  --form-string "title=tier-3 PR needs your approval: #${PR}" \
+                  --form-string "message=PR #${PR} is tier-3 (business/legal risk: money movement, data loss, or consent/GDPR) and is blocked until you add the jo-approved label. Read the Architect Gate verdict on the PR for what/why-risky/recommendation." \
+                  --form-string "url=${{ github.server_url }}/${{ github.repository }}/pull/${PR}" \
+                  --form-string "url_title=Open PR" \
+                  --form-string "priority=1" || true
+              fi
+              exit 1 ;;
+          esac
+
+      - name: Enable auto-merge (only after all gates green)
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Use --auto, NOT an immediate merge. `Gates Green` is itself a required
+          # status check on main, so an immediate `gh pr merge` is rejected with
+          # "base branch policy prohibits the merge" — at that instant this very job's
+          # check is still in-progress. --auto instead QUEUES the squash-merge; GitHub
+          # fires it the moment all required checks (incl. this job, once it finishes
+          # green) are satisfied. No --admin, required checks respected.
+          PR=${{ github.event.pull_request.number }}
+          echo "All gates green. Enabling auto-merge (squash) for PR #$PR..."
+          gh pr merge "$PR" --repo ${{ github.repository }} --auto --squash --delete-branch
