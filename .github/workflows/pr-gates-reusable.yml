@@ -416,6 +416,181 @@ jobs:
         if: steps.tier.outputs.run != 'true'
         run: echo "PR is tier-1 — architect gate not required. PASS."
 
+  # ADVISORY eval gate (promptfoo). Intentionally NOT in gates-green's `needs` and NOT a
+  # required check, so it can NEVER block auto-merge. Subtle but critical: a caller re-exports
+  # the WHOLE reusable run's result as its required "Gates Green" check, so ANY job here that
+  # concludes non-success (failure OR cancelled) would taint that result and block the merge —
+  # defeating "advisory". This job is therefore engineered to ALWAYS conclude `success`: EVERY
+  # step carries `continue-on-error: true`, and there is deliberately NO job-level
+  # `timeout-minutes` (a job timeout concludes `cancelled`, which a step's continue-on-error
+  # cannot absorb). The only long operations carry their own step timeouts. It only reports.
+  eval-gate:
+    name: Eval Gate (advisory)
+    needs: [workflow-lint]
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        continue-on-error: true
+      - name: Detect promptfoo config (root or promptfoo/)
+        id: detect
+        continue-on-error: true
+        run: |
+          # No-op safety: a caller WITHOUT a promptfoo config gets a green no-op, never a
+          # failure. Look for the config in the repo root and in promptfoo/ (.yaml or .yml).
+          config=""
+          for f in promptfooconfig.yaml promptfooconfig.yml promptfoo/promptfooconfig.yaml promptfoo/promptfooconfig.yml; do
+            if [ -f "$f" ]; then config="$f"; break; fi
+          done
+          if [ -z "$config" ]; then
+            echo "kein Eval-Config, skip — no promptfooconfig.yaml in root or promptfoo/. Advisory eval-gate is a no-op PASS."
+            echo "has_config=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Found promptfoo config: $config"
+            echo "has_config=true" >> "$GITHUB_OUTPUT"
+            echo "config_path=$config" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Set up Node (promptfoo runs via npx — no pnpm install / lockfile cache needed)
+        if: steps.detect.outputs.has_config == 'true'
+        continue-on-error: true
+        uses: actions/setup-node@v4
+        with:
+          # promptfoo@latest requires Node ^20.20.0 || >=22.22.0, so the fleet's bare `20`
+          # (which can resolve to a 20.x < 20.20.0) would make promptfoo refuse to run. Use the
+          # newest LTS to stay safely above the floor; this job only runs npx promptfoo, so the
+          # Node version is decoupled from the app's build/test Node.
+          node-version: lts/*
+      - name: Run promptfoo eval (advisory; DeepSeek judge supplied by the caller's config)
+        id: eval
+        if: steps.detect.outputs.has_config == 'true'
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          CONFIG_PATH: ${{ steps.detect.outputs.config_path }}
+          # The caller's promptfooconfig.yaml selects a cheap DeepSeek provider as the LLM
+          # judge; promptfoo's `deepseek:` provider reads DEEPSEEK_API_KEY. No Anthropic
+          # default judge is configured here.
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          PROMPTFOO_DISABLE_TELEMETRY: '1'
+          # Keep the captured stdout plain so the embedded <details> block has no ANSI escapes.
+          NO_COLOR: '1'
+          FORCE_COLOR: '0'
+        run: |
+          set +e
+          npx --yes promptfoo@latest eval -c "$CONFIG_PATH" -o /tmp/promptfoo-result.json > /tmp/promptfoo-eval.txt 2>&1
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          # Advisory: a non-zero promptfoo exit (e.g. 100 = some cases failed) must NOT fail the
+          # job. The verdict is computed and posted as a comment instead.
+          exit 0
+      - name: Build Eval Gate comment (score + per-case + advisory verdict)
+        id: report
+        if: steps.detect.outputs.has_config == 'true'
+        continue-on-error: true
+        env:
+          EVAL_EXIT: ${{ steps.eval.outputs.exit_code }}
+        run: |
+          # `set +e`: Actions runs `run:` with `bash -eo pipefail` by DEFAULT. Without this, a
+          # failing `jq` substitution on truncated/invalid promptfoo JSON (timeout-kill, crash,
+          # or judge-quota mid-write — all real fleet events) would abort the step and make the
+          # job conclude `failure`, which the caller's re-exported "Gates Green" check turns into
+          # a blocked merge. This report is best-effort and must ALWAYS finish writing the
+          # comment file and exit 0 so the job stays green and the PR still gets feedback.
+          set +e
+          result_json=/tmp/promptfoo-result.json
+          successes=0
+          failures=0
+          if [ -s "$result_json" ]; then
+            successes="$(jq -r '(.results.stats.successes // .stats.successes // 0)' "$result_json" 2>/dev/null)"
+            failures="$(jq -r '(.results.stats.failures // .stats.failures // 0)' "$result_json" 2>/dev/null)"
+          fi
+          case "$successes" in ''|*[!0-9]*) successes=0 ;; esac
+          case "$failures" in ''|*[!0-9]*) failures=0 ;; esac
+          total=$((successes + failures))
+          # Advisory verdict: PASS iff promptfoo exited 0 AND no failing cases.
+          if [ "${EVAL_EXIT:-1}" = "0" ] && [ "$failures" -eq 0 ]; then
+            verdict="PASS"
+          else
+            verdict="FAIL"
+          fi
+          rate="n/a"
+          if [ "$total" -gt 0 ]; then
+            rate="$(awk -v s="$successes" -v t="$total" 'BEGIN { printf "%.0f%%", (s / t) * 100 }')"
+          fi
+          cases="$(jq -r '
+            ((.results.results?) // (.results?) // [])
+            | map({ ok: (.success // false), score: (.score // 0),
+                    name: (.testCase.description? // .description? // .prompt.label? // "case") })
+            | .[]
+            | "| \(if .ok then "✅" else "❌" end) | \(.score) | \((.name | tostring) | gsub("[|\r\n]"; " ")) |"
+          ' "$result_json" 2>/dev/null || true)"
+          {
+            echo "## Eval Gate"
+            echo ""
+            # Deliberately "VERDICT (advisory):", NOT "VERDICT:" — the other gates grep PR
+            # comments for a line matching ^VERDICT: (e.g. claude-review's enforce fallback reads
+            # the LATEST such comment). A distinct prefix keeps this advisory verdict from being
+            # mistaken for a Gate-2/3 verdict.
+            echo "VERDICT (advisory): $verdict — does not block merge."
+            echo ""
+            if [ "$total" -gt 0 ]; then
+              echo "**Score:** ${successes}/${total} cases passed (${rate})."
+            else
+              echo "**Score:** no case stats parsed (promptfoo exit ${EVAL_EXIT:-unknown}). See output below."
+            fi
+            echo ""
+            if [ -n "$cases" ]; then
+              echo "| Result | Score | Case |"
+              echo "| --- | --- | --- |"
+              printf '%s\n' "$cases"
+              echo ""
+            elif [ "$total" -gt 0 ]; then
+              echo "_Per-case breakdown unavailable (promptfoo JSON schema drift); see raw output below._"
+              echo ""
+            fi
+            echo "<details><summary>promptfoo output</summary>"
+            echo ""
+            echo '```'
+            # Sanitize embedded tool output: strip any ANSI escapes and neutralize a leading
+            # "VERDICT:" so a line in promptfoo/judge output can never match another gate's
+            # ^VERDICT: comment-grep (markdown code fences do NOT shield lines from grep).
+            tail -c 50000 /tmp/promptfoo-eval.txt 2>/dev/null \
+              | sed -E 's/\x1b\[[0-9;]*m//g; s/^VERDICT:/VERDICT (eval-output):/' \
+              || echo "No promptfoo output captured."
+            echo '```'
+            echo ""
+            echo "</details>"
+          } > /tmp/eval_comment.md
+          exit 0
+      - name: Post Eval Gate comment to PR
+        if: steps.detect.outputs.has_config == 'true'
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          PR=${{ github.event.pull_request.number }}
+          gh pr comment "$PR" -F /tmp/eval_comment.md || true
+      - name: Eval Gate format-drift guard (advisory — warns, never fails)
+        if: steps.detect.outputs.has_config == 'true'
+        continue-on-error: true
+        run: |
+          # Parity with the other gates' drift guards, but advisory: on drift we emit a warning
+          # and still exit 0. A non-zero exit would taint the reusable run and block merge,
+          # which an advisory gate must never do.
+          if grep -qE '^## Eval Gate$' /tmp/eval_comment.md && grep -qE '^VERDICT \(advisory\): (PASS|FAIL)' /tmp/eval_comment.md; then
+            echo "Eval Gate comment format OK (heading + advisory verdict present)."
+          else
+            echo "::warning::Eval Gate — built comment missing '## Eval Gate' heading or advisory VERDICT line (format drift). Advisory only; merge unaffected."
+          fi
+      - name: No promptfoo config — advisory no-op PASS
+        if: steps.detect.outputs.has_config != 'true'
+        continue-on-error: true
+        run: echo "No promptfooconfig.yaml in caller (root or promptfoo/). Eval Gate is a no-op PASS — nothing to evaluate; merge unaffected."
+
   gates-green:
     name: Gates Green
     if: always() && github.event.pull_request.draft == false && github.event.pull_request.base.ref == 'main'

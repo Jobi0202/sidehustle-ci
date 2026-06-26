@@ -14,6 +14,10 @@ the private caller repos inject their secrets at runtime via `secrets: inherit`.
   `workflow-lint → lint, typecheck, unit, e2e → claude-review (Gate 2, DeepSeek) →
   codex-adversarial (Gate 3, OpenAI) + architect-gate (tier-2/3, Anthropic Opus) → gates-green`
   (alls-green aggregate + `gh pr merge --auto --squash`).
+  Plus `eval-gate (advisory)` — runs [promptfoo](https://www.promptfoo.dev/) against an
+  OPTIONAL `promptfooconfig.yaml` in the caller (root or `promptfoo/`) with a cheap DeepSeek
+  judge, posts a `## Eval Gate` comment, and is a no-op PASS when the caller has no config. It
+  is **not** in `gates-green`'s `needs` and **not** a required check, so it never blocks merge.
 
 ## How a repo consumes it (thin caller)
 
