@@ -11,13 +11,38 @@ the private caller repos inject their secrets at runtime via `secrets: inherit`.
 ## What's here
 
 - `.github/workflows/pr-gates-reusable.yml` — the full PR pipeline (`on: workflow_call`):
-  `workflow-lint → lint, typecheck, unit, e2e → claude-review (Gate 2, DeepSeek) →
-  codex-adversarial (Gate 3, OpenAI) + architect-gate (tier-2/3, Anthropic Opus) → gates-green`
-  (alls-green aggregate + `gh pr merge --auto --squash`).
+  `changes (paths-filter) → workflow-lint → lint, typecheck, unit → e2e → claude-review
+  (Gate 2, DeepSeek) → codex-adversarial (Gate 3, OpenAI) + architect-gate (tier-2/3,
+  Anthropic Opus) → gates-green` (alls-green aggregate + `gh pr merge --auto --squash`).
   Plus `eval-gate (advisory)` — runs [promptfoo](https://www.promptfoo.dev/) against an
   OPTIONAL `promptfooconfig.yaml` in the caller (root or `promptfoo/`) with a cheap DeepSeek
   judge, posts a `## Eval Gate` comment, and is a no-op PASS when the caller has no config. It
   is **not** in `gates-green`'s `needs` and **not** a required check, so it never blocks merge.
+
+### Cost controls (v3)
+
+- **Doc-only PRs skip the expensive jobs.** The first job, `changes`
+  ([dorny/paths-filter](https://github.com/dorny/paths-filter)), classifies the diff. A PR that
+  only touches docs (`**/*.md`, `specs/**`, `.claude/rules/**`, `docs/**`, `LICENSE`) sets
+  `code=false`, which **skips** `e2e` and all three AI gates (`claude-review`,
+  `codex-adversarial`, `architect-gate`) and the advisory `eval-gate`. `lint` / `typecheck` /
+  `unit` always run as the cheap floor, so a doc-only PR still aggregates green and merges
+  (`gates-green` forgives the skipped gates via alls-green `allowed-skips`).
+- **Cheap before expensive.** `e2e` and the AI gates only start after `lint` + `typecheck` are
+  green (they are in `needs`), so a lint/type error never burns a Playwright run or LLM quota.
+- **Playwright browsers are cached** on `~/.cache/ms-playwright`, keyed on OS + the installed
+  Playwright version.
+
+### Gate 3 (codex) — tier-gated, delta-aware
+
+`codex-adversarial` recomputes the risk tier at runtime from the diff (the caller's
+`scripts/classify-tier.sh`, exactly like `architect-gate`). It **blocks only on tier-2/3** PRs
+(a CRITICAL finding fails the gate); on **tier-1** it runs as **pure advisory** and never fails.
+Gate 2 (`claude-review`) remains the blocking floor on every code PR regardless of tier. On a
+re-run (`synchronize`) Gate 3 is **delta-aware**: it reads its previous marker-tagged verdict
+comment, re-checks each prior finding against the new HEAD, and limits new findings to the
+increment — instead of re-litigating the whole diff each cycle. The posted comment shows
+CRITICAL findings prominently and folds ADVISORY findings into a `<details>` block.
 
 ## How a repo consumes it (thin caller)
 
@@ -74,11 +99,17 @@ Set on the caller repo (values never live here): `DEEPSEEK_API_KEY`, `OPENAI_API
 `CLAUDE_CODE_OAUTH_TOKEN`. Optional: `ANTHROPIC_API_KEY` (Gate 2 rollback),
 `PUSHOVER_APP_TOKEN` / `PUSHOVER_USER_KEY` (tier-3 block alert). `GITHUB_TOKEN` is automatic.
 
-## Pinning: `@main` (with a `v1` snapshot tag)
+## Pinning: `@main` (with snapshot tags `v1`/`v2`/`v3`)
 
 Callers pin **`@main`** so a central change — e.g. the post-15.06 *Max-Switch* (Gate 3
 OpenAI → Anthropic Opus) — propagates to every caller with **no child edit**. The usual
 "pin an immutable SHA/tag" supply-chain caution is about untrusted third-party actions; this
 repo is single-owner and YAML-only, so `@main` is the right trade-off for fleet-wide
-propagation. A moving **`v1`** tag is also published as a stable snapshot for anyone who
-prefers an immutable-ish pin; bump it (or just push `main`) to roll out a central change.
+propagation. Snapshot tags are also published for anyone who prefers an immutable-ish pin:
+
+- **`v1`** — original monolithic-parity reusable.
+- **`v2`** — adds the `merge_mode` input (`auto` | `direct`) for Free-plan hands-off merge.
+- **`v3`** — cost controls (doc-only skip, cheap-before-expensive, Playwright cache) +
+  advisory `eval-gate` + tier-gated, delta-aware Gate 3.
+
+Bump the tag (or just push `main`) to roll out a central change.

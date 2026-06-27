@@ -3,8 +3,22 @@
 # by each private caller via `secrets: inherit`). The github context inside a called
 # workflow is the CALLER's event, so github.event.pull_request.* and github.repository
 # resolve to the caller's PR/repo, and each job's checkout reads the caller repo
-# (scripts/classify-tier.sh + .claude/rules/* live there). Job bodies are byte-identical
-# to the foundation's former monolithic pr-gates.yml — only this header changed.
+# (scripts/classify-tier.sh + .claude/rules/* live there).
+#
+# COST CONTROLS (v3):
+#   - `changes` (dorny/paths-filter) is the first job. Doc-only PRs (**/*.md, specs/**,
+#     .claude/rules/**, docs/**, LICENSE) set code=false, which SKIPS the expensive jobs
+#     (e2e + all three AI gates + eval). lint/typecheck/unit ALWAYS run as the floor.
+#   - Cheap before expensive: e2e and the AI gates only start after lint+typecheck are
+#     green (they are in `needs`), so a lint/type error never burns Playwright or LLM cost.
+#   - Playwright browsers are cached (~/.cache/ms-playwright, keyed on OS + version).
+#   - gates-green treats SKIPPED gate jobs as PASS (alls-green `allowed-skips`), so a
+#     doc-only PR — where the gates are skipped — still aggregates green and merges.
+#
+# GATE 3 (codex-adversarial) is tier-gated: it BLOCKS only on tier-2/3 PRs (tier recomputed
+# at runtime from the diff via the caller's scripts/classify-tier.sh, exactly like
+# architect-gate); on tier-1 it runs as pure advisory (never fails). Gate 2 (claude-review)
+# stays the blocking floor on every code PR regardless of tier.
 name: Reusable PR Gates
 
 on:
@@ -42,6 +56,35 @@ on:
         required: false
 
 jobs:
+  # ---------------------------------------------------------------------------------------
+  # COST GATE — classify the diff as code-touching or doc-only. Doc-only PRs skip every
+  # expensive job below (e2e + the three AI gates + eval). Uses the GitHub REST API to list
+  # the caller PR's changed files, so it needs no checkout. `predicate-quantifier: every`
+  # + dot:true (paths-filter default) means a file counts as `code` only when it matches
+  # `**` AND none of the doc-only negations — i.e. code=true iff >=1 non-doc file changed.
+  # ---------------------------------------------------------------------------------------
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          predicate-quantifier: 'every'
+          filters: |
+            code:
+              - '**'
+              - '!**/*.md'
+              - '!specs/**'
+              - '!.claude/rules/**'
+              - '!docs/**'
+              - '!LICENSE'
+
   workflow-lint:
     name: Workflow Lint
     runs-on: ubuntu-latest
@@ -51,6 +94,8 @@ jobs:
         with:
           args: -color
 
+  # lint / typecheck / unit ALWAYS run (the cheap floor) — even on doc-only PRs, so a
+  # green doc-only PR still has the required jobs concluding `success` and can merge.
   lint:
     name: Lint
     needs: [workflow-lint]
@@ -93,9 +138,13 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm test
 
+  # E2E is expensive (Playwright browser download + real browser run). Skip it on doc-only
+  # PRs, and only start it after lint+typecheck are green so a cheap failure short-circuits
+  # the browser cost. Browsers are cached on ~/.cache/ms-playwright keyed by OS + version.
   e2e:
     name: E2E Tests
-    needs: [workflow-lint]
+    needs: [workflow-lint, changes, lint, typecheck, unit]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -105,6 +154,23 @@ jobs:
           node-version: 20
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Resolve Playwright version (for cache key)
+        id: pw
+        run: |
+          # Read the installed Playwright version so the browser cache invalidates on a
+          # version bump. Resilient: an unparseable/absent version falls back to a generic
+          # bucket rather than failing the job here (pnpm test:e2e is the real e2e gate).
+          version="$(pnpm exec playwright --version 2>/dev/null | awk '{print $NF}' || true)"
+          echo "version=${version:-unknown}" >> "$GITHUB_OUTPUT"
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ steps.pw.outputs.version }}
+          # Warm from the most recent browser cache when the version probe misses
+          # (e.g. resolves to the 'unknown' bucket) instead of re-downloading.
+          restore-keys: |
+            ${{ runner.os }}-playwright-
       - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm test:e2e
       - uses: actions/upload-artifact@v4
@@ -116,8 +182,8 @@ jobs:
 
   claude-review:
     name: Claude Review (Gate 2)
-    needs: [workflow-lint, lint, typecheck, unit, e2e]
-    if: github.event.pull_request.draft == false
+    needs: [workflow-lint, changes, lint, typecheck, unit, e2e]
+    if: needs.changes.outputs.code == 'true' && github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -202,9 +268,14 @@ jobs:
           # Condition 2 (independent): the VERDICT *content* must be PASS. The reviewer
           # posts the canonical verdict to a PR comment and/or stdout; read the VERDICT
           # value from stdout first, else from the latest PR comment.
-          verdict="$(grep -oE '^VERDICT:[[:space:]]*(PASS|FAIL|PARTIAL)' /tmp/claude_review.txt 2>/dev/null | head -1 | awk '{print $2}')"
+          # `|| true` on each substitution: a no-match sed/grep exits non-zero, which under
+          # the default `bash -eo pipefail` would abort the step at the assignment and make
+          # the comment fallback UNREACHABLE — false-FAILing a PR whose VERDICT lives only in
+          # a PR comment (the documented comment-only path). sed-capture also tolerates a
+          # no-space `VERDICT:PASS`.
+          verdict="$(sed -nE 's/^VERDICT:[[:space:]]*(PASS|FAIL|PARTIAL).*/\1/p' /tmp/claude_review.txt 2>/dev/null | head -1 || true)"
           if [ -z "$verdict" ]; then
-            verdict="$(gh pr view "$PR" --repo "${{ github.repository }}" --json comments --jq '.comments[].body' | grep -oE '^VERDICT:[[:space:]]*(PASS|FAIL|PARTIAL)' | tail -1 | awk '{print $2}')"
+            verdict="$(gh pr view "$PR" --repo "${{ github.repository }}" --json comments --jq '.comments[].body' | sed -nE 's/^VERDICT:[[:space:]]*(PASS|FAIL|PARTIAL).*/\1/p' | tail -1 || true)"
           fi
           if [ "$verdict" = "PASS" ]; then
             echo "Gate 2 PASSED (VERDICT: PASS, exit 0)."
@@ -215,8 +286,8 @@ jobs:
 
   codex-adversarial:
     name: Codex Adversarial Review (Gate 3)
-    needs: [workflow-lint, claude-review]
-    if: github.event.pull_request.draft == false
+    needs: [workflow-lint, changes, claude-review]
+    if: needs.changes.outputs.code == 'true' && github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -224,12 +295,56 @@ jobs:
       issues: write
     # Pure OpenAI stack — no Anthropic/DeepSeek env here. Gate 3's cross-family
     # anchor: Gate 2 reviews on DeepSeek, Gate 3 adversarially re-reviews on OpenAI.
+    # BLOCKING only on tier-2/3 (tier recomputed from the diff, like architect-gate);
+    # tier-1 = pure advisory. Gate 2 remains the floor on all code PRs.
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Determine tier (recomputed from the diff — only tier-2/3 blocks)
+        id: tier
+        run: |
+          # Recompute the tier authoritatively from the diff via the shared classifier in
+          # the caller. Labels are mutable, so the gate must not trust them. tier-2/3 =>
+          # Gate 3 blocks on a CRITICAL; tier-1 => Gate 3 is advisory only (never fails).
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          files="$(git diff --name-only "$base" "$head")"
+          tier="$(printf '%s\n' "$files" | bash scripts/classify-tier.sh)"
+          echo "Computed tier: $tier"
+          case "$tier" in
+            tier-2|tier-3) echo "blocking=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "blocking=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Fetch previous Gate 3 verdict (delta-awareness)
+        run: |
+          # Pull the most recent marker-tagged Gate-3 verdict so codex can do a DELTA
+          # review on a re-run (synchronize) instead of re-litigating the whole diff and
+          # surfacing a fresh angle each cycle. Empty files on the first review.
+          PR=${{ github.event.pull_request.number }}
+          gh pr view "$PR" --repo "${{ github.repository }}" --json comments \
+            --jq '([.comments[] | select(.body | contains("<!-- gate3-codex-verdict -->")) | .body] | last) // ""' \
+            > prev-verdict.md 2>/dev/null || true
+          [ -f prev-verdict.md ] || : > prev-verdict.md
+          prev_sha="$(grep -oE 'REVIEWED_SHA: [0-9a-f]{7,40}' prev-verdict.md | tail -1 | awk '{print $2}' || true)"
+          # If the recorded SHA is unreachable (author force-pushed/rebased away the old
+          # head), blank it so the codex prompt falls back to a full base..HEAD review rather
+          # than `git diff <missing-sha> HEAD` (which would yield an empty/garbled increment).
+          if [ -n "${prev_sha:-}" ] && ! git cat-file -e "${prev_sha}^{commit}" 2>/dev/null; then
+            echo "Recorded REVIEWED_SHA ${prev_sha} is unreachable (force-push/rebase) — full review."
+            prev_sha=""
+          fi
+          printf '%s' "${prev_sha:-}" > prev-sha.txt
+          if [ -n "${prev_sha:-}" ]; then
+            echo "Previous Gate-3 review found (last reviewed sha=${prev_sha}) — delta mode."
+          else
+            echo "No usable previous Gate-3 review — full review."
+          fi
+
       - name: Codex adversarial review (headless, openai/codex-action)
         id: codex
         continue-on-error: true
@@ -249,9 +364,24 @@ jobs:
             You are the Gate 3 adversarial reviewer for this pull request. Do NOT modify
             any files — this is a read-only review.
 
-            Scope: review the diff between the PR base commit
-            ${{ github.event.pull_request.base.sha }} and HEAD. Run
-            `git diff ${{ github.event.pull_request.base.sha }} HEAD` to see every change.
+            DELTA-AWARENESS (read this FIRST):
+            - Your previous Gate-3 verdict for this PR, if any, is in ./prev-verdict.md
+              (empty on the first review). The git SHA you last reviewed is in
+              ./prev-sha.txt (empty on the first review).
+            - FIRST REVIEW (prev-sha.txt empty): review the full diff between the PR base
+              ${{ github.event.pull_request.base.sha }} and HEAD —
+              run `git diff ${{ github.event.pull_request.base.sha }} HEAD`.
+            - RE-REVIEW (prev-sha.txt non-empty): the author pushed a fix. Do EXACTLY two
+              things: (1) re-check EACH prior finding in ./prev-verdict.md against the CURRENT
+              HEAD and record it in the `PRIOR FINDINGS:` block (see output format) as
+              `[RESOLVED]` if it is fixed (BEHOBEN — cite the fix) or `[STILL-OPEN]` if not; a
+              still-open prior finding ALSO appears once in `FINDINGS:` with its
+              `[CRITICAL]`/`[ADVISORY]` tag. (2) look for NEW issues ONLY in the increment
+              since your last review — run `git diff "$(cat ./prev-sha.txt)" HEAD`. Do NOT
+              re-raise a finding the current diff already resolves (list it ONLY as
+              `[RESOLVED]`, never as `[CRITICAL]`/`[ADVISORY]`), and do NOT invent new ADVISORY
+              side-quests to justify a FAIL. If every prior CRITICAL is resolved and the
+              increment adds no new CRITICAL, the verdict is PASS.
 
             Apply the rubric in ./.claude/rules/review.md — all six criteria (Issue Match,
             Architecture, Test Sufficiency, Code Health, Boy Scout, Safety). Be adversarial,
@@ -266,43 +396,130 @@ jobs:
                 drift, test rigor/coverage suggestions, robustness/edge-case hardening,
                 performance, "nice to have". ADVISORY findings NEVER cause FAIL.
 
+            KNOWN NON-ISSUES — never classify these as CRITICAL (deliberate or N/A):
+            - Typed-query / generated-types regeneration: the architecture.md "regenerate
+              typed queries after a schema change" Change-Safety clause applies ONLY if this
+              repo actually ships a GENERATED Database type (e.g. a committed generated types
+              artifact such as database.types.ts, or generated Drizzle/Supabase schema
+              types). MANY repos use UNTYPED Supabase/DB clients — there this clause is N/A.
+              Do NOT demand typed-query regeneration, or FAIL for "missing regenerated
+              types", unless you can point to an actual generated type artifact in THIS repo
+              that the change invalidates. Absent that artifact, it is NOT a finding.
+            - Deliberate fleet-canonical decisions — do NOT re-litigate these as findings:
+              the canonical commit author identity (Jobi0202 <tomorrow.tech.lab@gmail.com>);
+              the Free-plan setup (no branch protection — "merge only when green" is enforced
+              by the workflow job-graph, not by GitHub required checks); and the merge_mode
+              input (auto vs direct) and @main/tag pinning of the shared reusable workflow.
+              These are intentional, owner-approved conventions, not defects.
+            - Your OWN sandbox limits are NOT repo defects: if you cannot fetch PR metadata,
+              reach the network, run gh, or run pnpm/tests in this read-only sandbox, do NOT
+              report that as a finding — it is an environment constraint, not a code problem.
+
             Decide the verdict by this rule ONLY:
               VERDICT: FAIL  iff there is at least one CRITICAL finding;
               VERDICT: PASS  iff there are zero CRITICAL findings (ADVISORY findings are OK).
 
-            Delta-awareness: if you have reviewed this PR before, read your previous verdict
-            comment first. Do NOT re-raise findings the current diff already resolves, and do
-            NOT invent new ADVISORY side-quests to justify a FAIL.
-
             Output format (output ONLY this, nothing else):
             - FIRST line, exactly: `VERDICT: PASS` or `VERDICT: FAIL`.
             - Then the six CRITERIA lines (`- <Criterion>: PASS|FAIL — <evidence>`).
-            - Then `FINDINGS:` and one line per finding, each starting with `[CRITICAL]` or
-              `[ADVISORY]` followed by `<path:line> — <required fix>`. Write `[none]` if there
-              are no findings.
+            - On a RE-REVIEW only, a `PRIOR FINDINGS:` block — one line per prior finding you
+              audited, each starting with `[RESOLVED]` (BEHOBEN) or `[STILL-OPEN]`, then
+              `<path:line> — <evidence>`. This block is an audit trail and is NOT counted.
+            - Then `FINDINGS:` and one line per CURRENTLY-OPEN finding, each starting with
+              `[CRITICAL]` or `[ADVISORY]` followed by `<path:line> — <required fix>`. Write
+              `[none]` if there are no open findings. NEVER tag a resolved/BEHOBEN finding
+              `[CRITICAL]` or `[ADVISORY]` — a resolved finding belongs ONLY in PRIOR FINDINGS
+              as `[RESOLVED]`.
             - LAST line, exactly: `SEVERITY_SUMMARY: CRITICAL=<n> ADVISORY=<m>` where <n> is
-              the number of [CRITICAL] lines and <m> the number of [ADVISORY] lines.
+              the number of currently-open [CRITICAL] lines and <m> the open [ADVISORY] lines.
 
-      - name: Post Codex verdict to PR
+      - name: Post Codex verdict to PR (CRITICAL prominent, ADVISORY collapsed)
         if: always()
         run: |
+          # set +e: this step is a pure formatter/poster. On a tier-1 PR the job RAN (so
+          # alls-green does not forgive it via allowed-skips) — a formatter crash under the
+          # default errexit would taint gates-green even though Gate 3 is advisory here.
+          set +e
           PR=${{ github.event.pull_request.number }}
+          HEAD_SHA='${{ github.event.pull_request.head.sha }}'
+          BLOCKING='${{ steps.tier.outputs.blocking }}'
+          out=codex-output.md
           {
+            # Hidden marker so the next run's delta-fetch can find THIS verdict.
+            echo "<!-- gate3-codex-verdict -->"
             echo "## Gate 3 — Codex Adversarial Review (openai/codex-action)"
             echo ""
-            if [ -s codex-output.md ]; then
-              cat codex-output.md
+            if [ "$BLOCKING" = "true" ]; then
+              echo "_Tier-2/3 PR — Gate 3 is BLOCKING (a CRITICAL finding fails the gate)._"
             else
-              echo "_No verdict produced — codex-action emitted no output (treated as FAIL)._"
+              echo "_Tier-1 PR — Gate 3 is ADVISORY only (does not block merge; Gate 2 is the floor)._"
             fi
+            echo ""
+            if [ -s "$out" ]; then
+              # Headline verdict, rendered bold so the line does NOT begin with `VERDICT:`
+              # (other gates grep PR comments for ^VERDICT:; keep this from colliding).
+              head -n1 "$out" | sed 's/^VERDICT:/**VERDICT:**/'
+              echo ""
+              # Six criteria lines.
+              grep -E '^- (Issue Match|Architecture|Test Sufficiency|Code Health|Boy Scout|Safety):' "$out" || true
+              echo ""
+              crit_lines="$(grep -E '^[[:space:]]*(- )?\[CRITICAL\]' "$out" 2>/dev/null | grep -viE 'BEHOBEN|RESOLVED' || true)"
+              if [ -n "$crit_lines" ]; then
+                echo "### ⛔ CRITICAL findings"
+                echo ""
+                printf '%s\n' "$crit_lines"
+              else
+                echo "### ✅ No CRITICAL findings"
+              fi
+              echo ""
+              adv_lines="$(grep -E '^[[:space:]]*(- )?\[ADVISORY\]' "$out" || true)"
+              if [ -n "$adv_lines" ]; then
+                adv_count="$(printf '%s\n' "$adv_lines" | grep -c . || true)"
+                echo "<details><summary>Advisory findings (${adv_count}) — non-blocking</summary>"
+                echo ""
+                printf '%s\n' "$adv_lines"
+                echo ""
+                echo "</details>"
+                echo ""
+              fi
+              resolved_lines="$(grep -E '^[[:space:]]*(- )?\[RESOLVED\]' "$out" 2>/dev/null || true)"
+              if [ -n "$resolved_lines" ]; then
+                res_count="$(printf '%s\n' "$resolved_lines" | grep -c . || true)"
+                echo "<details><summary>✅ Resolved since last review (${res_count})</summary>"
+                echo ""
+                printf '%s\n' "$resolved_lines"
+                echo ""
+                echo "</details>"
+                echo ""
+              fi
+              echo "<details><summary>Full codex output</summary>"
+              echo ""
+              echo '```'
+              # Neutralize a leading VERDICT:/SEVERITY line inside the fenced raw block so it
+              # can't be mistaken for another gate's ^VERDICT: comment-grep (fences do not
+              # shield lines from grep).
+              sed -E 's/^VERDICT:/VERDICT (codex-output):/' "$out"
+              echo '```'
+              echo "</details>"
+            else
+              echo "**VERDICT:** (none) — codex-action emitted no output."
+              if [ "$BLOCKING" = "true" ]; then
+                echo ""
+                echo "_Treated as FAIL on this tier-2/3 PR._"
+              fi
+            fi
+            echo ""
+            # Machine-readable footer the next run reads to scope its delta review.
+            echo "REVIEWED_SHA: ${HEAD_SHA}"
           } > /tmp/codex_verdict.md
           gh pr comment "$PR" -F /tmp/codex_verdict.md || true
 
-      - name: Verify VERDICT format present (Gate 3 format-drift guard)
+      - name: Verify VERDICT format present (Gate 3 format-drift guard — tier-2/3 only)
+        if: steps.tier.outputs.blocking == 'true'
         run: |
-          # Fail-safe: any format drift => FAIL, so a malformed review can never become a
-          # silent PASS. Requires (a) a canonical first-line VERDICT and (b) the
-          # machine-readable SEVERITY_SUMMARY line the enforce step parses.
+          # Fail-safe on a BLOCKING PR: any format drift => FAIL, so a malformed review can
+          # never become a silent PASS. Requires (a) a canonical first-line VERDICT and (b)
+          # the machine-readable SEVERITY_SUMMARY line the enforce step parses.
           first_line="$(head -n1 codex-output.md 2>/dev/null || true)"
           if ! printf '%s\n' "$first_line" | grep -qE '^VERDICT:[[:space:]]*(PASS|FAIL)[[:space:]]*$'; then
             echo "::error::Gate 3 — first line of codex-output.md is not 'VERDICT: PASS|FAIL'. Got: ${first_line:-<empty>}. Failing gate."
@@ -314,7 +531,8 @@ jobs:
           fi
           echo "Format OK: $first_line"
 
-      - name: Enforce gate verdict (severity gate — only CRITICAL blocks)
+      - name: Enforce gate verdict (severity gate — tier-2/3, only CRITICAL blocks)
+        if: steps.tier.outputs.blocking == 'true'
         run: |
           # (1) The codex-action step itself must have succeeded (guards continue-on-error
           #     so an action failure can never be masked by a stale output file).
@@ -329,19 +547,34 @@ jobs:
           summary="$(grep -E '^SEVERITY_SUMMARY: CRITICAL=[0-9]+ ADVISORY=[0-9]+$' codex-output.md | tail -1 || true)"
           sum_crit="$(printf '%s' "$summary" | sed -nE 's/^SEVERITY_SUMMARY: CRITICAL=([0-9]+).*/\1/p')"
           sum_crit="${sum_crit:-0}"
-          tag_crit="$(grep -cE '^[[:space:]]*(- )?\[CRITICAL\]' codex-output.md || true)"
+          # Count ONLY currently-open criticals: a delta re-review records resolved findings
+          # as [RESOLVED] (not [CRITICAL]); the extra BEHOBEN/RESOLVED exclusion is a guard in
+          # case the model still appends a resolution note to a [CRITICAL] line.
+          tag_crit="$(grep -E '^[[:space:]]*(- )?\[CRITICAL\]' codex-output.md 2>/dev/null | grep -vciE 'BEHOBEN|RESOLVED' || true)"
           tag_crit="${tag_crit:-0}"
           crit=$(( sum_crit > tag_crit ? sum_crit : tag_crit ))
           if [ "$crit" -gt 0 ]; then
-            echo "::error::Gate 3 FAILED — ${crit} CRITICAL finding(s). (ADVISORY findings are non-blocking.)"
+            echo "::error::Gate 3 FAILED — ${crit} CRITICAL finding(s) on a tier-2/3 PR. (ADVISORY findings are non-blocking.)"
             exit 1
           fi
           echo "Gate 3 PASSED — 0 CRITICAL findings; advisories (if any) are non-blocking."
 
+      - name: Tier-1 — Gate 3 advisory only (never blocks)
+        if: steps.tier.outputs.blocking != 'true'
+        run: |
+          # tier-1 PR: Gate 3 is advisory. The verdict comment is already posted above; we
+          # only log the outcome and always exit 0. Gate 2 (claude-review) remains the floor.
+          if [ -s codex-output.md ]; then
+            crit="$(grep -E '^[[:space:]]*(- )?\[CRITICAL\]' codex-output.md 2>/dev/null | grep -vciE 'BEHOBEN|RESOLVED' || true)"
+            echo "Gate 3 (advisory, tier-1): codex ran (step outcome=${{ steps.codex.outcome }}), ${crit:-0} open CRITICAL finding(s) reported — NOT blocking on tier-1."
+          else
+            echo "Gate 3 (advisory, tier-1): no codex output (step outcome=${{ steps.codex.outcome }}) — NOT blocking on tier-1."
+          fi
+
   architect-gate:
     name: Architect Gate (tier-2/3)
-    needs: [workflow-lint, claude-review]
-    if: github.event.pull_request.draft == false
+    needs: [workflow-lint, changes, claude-review]
+    if: needs.changes.outputs.code == 'true' && github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -420,14 +653,17 @@ jobs:
   # required check, so it can NEVER block auto-merge. Subtle but critical: a caller re-exports
   # the WHOLE reusable run's result as its required "Gates Green" check, so ANY job here that
   # concludes non-success (failure OR cancelled) would taint that result and block the merge —
-  # defeating "advisory". This job is therefore engineered to ALWAYS conclude `success`: EVERY
-  # step carries `continue-on-error: true`, and there is deliberately NO job-level
-  # `timeout-minutes` (a job timeout concludes `cancelled`, which a step's continue-on-error
-  # cannot absorb). The only long operations carry their own step timeouts. It only reports.
+  # defeating "advisory". This job is therefore engineered, WHEN IT RUNS, to ALWAYS conclude
+  # `success`: EVERY step carries `continue-on-error: true`, and there is deliberately NO
+  # job-level `timeout-minutes` (a job timeout concludes `cancelled`, which a step's
+  # continue-on-error cannot absorb). The only long operations carry their own step timeouts.
+  # It only reports. Skipped on doc-only/draft PRs (changes.code == false / draft) like the
+  # other expensive jobs; a `skipped` job — like a `success` one — does not taint the caller's
+  # re-exported run result, so the never-block guarantee holds whether it runs or is skipped.
   eval-gate:
     name: Eval Gate (advisory)
-    needs: [workflow-lint]
-    if: github.event.pull_request.draft == false
+    needs: [workflow-lint, changes, lint, typecheck]
+    if: needs.changes.outputs.code == 'true' && github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -594,7 +830,7 @@ jobs:
   gates-green:
     name: Gates Green
     if: always() && github.event.pull_request.draft == false && github.event.pull_request.base.ref == 'main'
-    needs: [workflow-lint, lint, typecheck, unit, e2e, claude-review, codex-adversarial, architect-gate]
+    needs: [workflow-lint, changes, lint, typecheck, unit, e2e, claude-review, codex-adversarial, architect-gate]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -605,6 +841,11 @@ jobs:
         id: alls
         uses: re-actors/alls-green@release/v1
         with:
+          # Doc-only PRs SKIP these jobs (changes.code == false). alls-green forgives a
+          # skipped job listed here (treats it as PASS), but if one actually RUNS and FAILS
+          # it still votes FAIL — so a code PR's gate failure still blocks the merge.
+          # workflow-lint / changes / lint / typecheck / unit always run and always vote.
+          allowed-skips: e2e, claude-review, codex-adversarial, architect-gate
           jobs: ${{ toJSON(needs) }}
 
       - name: Checkout (to recompute the tier from the diff)
@@ -630,8 +871,21 @@ jobs:
           files="$(git diff --name-only "$base" "$head")"
           tier="$(printf '%s\n' "$files" | bash scripts/classify-tier.sh)"
           echo "Recomputed tier: $tier"
+          if [ "$tier" = "tier-2" ]; then
+            # A file can be doc-classified by the `changes` job (so architect-gate was SKIPPED)
+            # yet be tier-2 by content/path — e.g. an unsafe migration .sql under docs/, or an
+            # auth/ file. Do NOT assume architect-gate "carried" it: assert it actually
+            # ran-and-passed (a skipped or failed job reports result != 'success').
+            arch_result='${{ needs.architect-gate.result }}'
+            if [ "$arch_result" != "success" ]; then
+              echo "::error::Recomputed tier-2 but architect-gate did not run-and-pass (result=${arch_result}). A doc-classified file (under docs/, specs/, *.md, ...) can still be tier-2 by content/path and would skip architect-gate. Blocking merge."
+              exit 1
+            fi
+            echo "Recomputed tier-2 and architect-gate concluded success — merge allowed."
+            exit 0
+          fi
           if [ "$tier" != "tier-3" ]; then
-            echo "Recomputed $tier — not tier-3, merge allowed (tier-2 was carried by architect-gate)."
+            echo "Recomputed $tier (tier-1) — merge allowed."
             exit 0
           fi
           labels=$(gh pr view "$PR" --repo "${{ github.repository }}" --json labels --jq '[.labels[].name] | join(",")')
